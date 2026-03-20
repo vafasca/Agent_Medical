@@ -1,28 +1,19 @@
-import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
+import { NextResponse } from 'next/server';
 
-const DATA_DIR = '/home/z/my-project/data';
-const API_KEYS_FILE = path.join(DATA_DIR, 'api-keys.json');
+import { readJsonFile } from '@/lib/app-data';
 
-// GET - Obtener configuraciones
+const API_KEYS_FILE = 'api-keys.json';
+
 export async function GET() {
   try {
-    let hasApiKey = false;
-    let activeModel = null;
-    
-    if (fs.existsSync(API_KEYS_FILE)) {
-      const keys = JSON.parse(fs.readFileSync(API_KEYS_FILE, 'utf-8'));
-      const activeKey = keys.find((k: { isActive: boolean }) => k.isActive);
-      hasApiKey = !!activeKey;
-      activeModel = activeKey?.model || null;
-    }
+    const keys = readJsonFile<{ isActive: boolean; model?: string }[]>(API_KEYS_FILE, []);
+    const activeKey = keys.find((k) => k.isActive);
 
     return NextResponse.json({
       success: true,
       data: {
-        hasApiKey,
-        activeModel,
+        hasApiKey: !!activeKey,
+        activeModel: activeKey?.model || null,
       },
     });
   } catch (error) {

@@ -1,391 +1,174 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
 
-const DATA_DIR = '/home/z/my-project/data';
-const CONVERSATIONS_FILE = path.join(DATA_DIR, 'conversations.json');
-const LEADS_FILE = path.join(DATA_DIR, 'leads.json');
-const SOCIAL_FILE = path.join(DATA_DIR, 'social.json');
-const API_KEYS_FILE = path.join(DATA_DIR, 'api-keys.json');
-const KNOWLEDGE_FILE = path.join(DATA_DIR, 'knowledge.json');
+import { analyzeLeadIntent, calculateLeadScore, chatWithGroq } from '@/lib/ai';
+import { db } from '@/lib/db';
 
-// Interfaces
-interface Message {
-  id: string;
-  content: string;
-  direction: 'incoming' | 'outgoing';
-  messageType: string;
-  isFromBot: boolean;
-  createdAt: string;
+function mapInterestToStage(interest: 'low' | 'medium' | 'high') {
+  if (interest === 'high') return 'decision';
+  if (interest === 'medium') return 'consideration';
+  return 'awareness';
 }
 
-interface Conversation {
-  id: string;
-  externalId: string;
-  platform: string;
-  name: string | null;
-  username: string | null;
-  phone: string | null;
-  status: string;
-  leadStatus: string;
-  leadScore: number;
-  lastMessage: string | null;
-  lastMessageAt: string | null;
-  lastMessageDir: string | null;
-  unreadCount: number;
-  messages: Message[];
-  createdAt: string;
-}
-
-interface Lead {
-  id: string;
-  conversationId: string;
-  name: string | null;
-  email: string | null;
-  phone: string | null;
-  interest: string | null;
-  score: number;
-  stage: string;
-  notes: string | null;
-  source: string;
-  createdAt: string;
-}
-
-interface SocialConnection {
-  id: string;
-  platform: string;
-  name: string;
-  botToken: string | null;
-  accessToken: string | null;
-  phoneNumberId: string | null;
-  isActive: boolean;
-  createdAt: string;
-}
-
-interface ApiKey {
-  id: string;
-  provider: string;
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-  isActive: boolean;
-}
-
-interface KnowledgeItem {
-  id: string;
-  title: string;
-  content: string;
-  priority: number;
-  isActive: boolean;
-}
-
-// Helper functions
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-}
-
-function readJsonFile<T>(filePath: string, defaultValue: T): T {
-  ensureDataDir();
-  if (!fs.existsSync(filePath)) return defaultValue;
+export async function POST(request: NextRequest) {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-  } catch {
-    return defaultValue;
-  }
-}
+    const body = await request.json();
+    const message = body.message;
 
-function writeJsonFile<T>(filePath: string, data: T) {
-  ensureDataDir();
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-}
+    if (!message?.text) {
+      return NextResponse.json({ status: 'ignored', reason: 'no_text_message' });
+    }
 
-// AI Chat function
-async function chatWithAI(messages: { role: string; content: string }[]): Promise<string> {
-  const apiKeys = readJsonFile<ApiKey[]>(API_KEYS_FILE, []);
-  const activeKey = apiKeys.find(k => k.isActive);
-  
-  if (!activeKey) {
-    return 'No hay API key configurada. Por favor, configura una API key en la sección de Configuración.';
-  }
+    const chatId = String(message.chat?.id || message.from?.id || '');
+    const userId = String(message.from?.id || chatId);
+    const text = String(message.text || '').trim();
+    const senderName = message.from?.first_name || message.from?.username || message.chat?.title || 'Usuario';
 
-  const knowledge = readJsonFile<KnowledgeItem[]>(KNOWLEDGE_FILE, []);
-  const activeKnowledge = knowledge
-    .filter(k => k.isActive)
-    .sort((a, b) => b.priority - a.priority)
-    .slice(0, 10);
+    const connection = await db.socialConnection.findFirst({
+      where: { platform: 'telegram', isActive: true, botToken: { not: null } },
+      orderBy: { updatedAt: 'desc' },
+    });
 
-  const knowledgeContext = activeKnowledge
-    .map(k => `## ${k.title}\n${k.content}`)
-    .join('\n\n');
+    if (!connection?.botToken) {
+      return NextResponse.json({ status: 'no_connection' }, { status: 400 });
+    }
 
-  const systemPrompt = `Eres un asistente virtual profesional especializado en la venta de cursos médicos.
+    let conversation = await db.conversation.findUnique({
+      where: { externalId: `telegram:${chatId}` },
+      include: { messages: true, lead: true },
+    });
 
-## Información sobre los cursos:
-${knowledgeContext || 'Responde de manera útil y profesional.'}
+    if (!conversation) {
+      conversation = await db.conversation.create({
+        data: {
+          externalId: `telegram:${chatId}`,
+          platform: 'telegram',
+          platformUserId: userId,
+          name: senderName,
+          username: message.from?.username || null,
+          status: 'active',
+          leadStatus: 'new',
+          leadScore: 0,
+          lastMessage: text.slice(0, 500),
+          lastMessageAt: new Date(),
+          lastMessageDir: 'incoming',
+          unreadCount: 1,
+        },
+        include: { messages: true, lead: true },
+      });
+    }
 
-## Instrucciones:
-- Responde de manera concisa pero completa
-- Si el usuario muestra interés, pregunta si desea más información`;
+    await db.message.create({
+      data: {
+        conversationId: conversation.id,
+        externalId: String(message.message_id || Date.now()),
+        content: text,
+        direction: 'incoming',
+        messageType: 'text',
+        isFromBot: false,
+      },
+    });
 
-  let url: string;
-  let headers: Record<string, string>;
+    const history = await db.message.findMany({
+      where: { conversationId: conversation.id },
+      orderBy: { createdAt: 'asc' },
+      take: 20,
+    });
 
-  if (activeKey.provider === 'openrouter') {
-    url = 'https://openrouter.ai/api/v1/chat/completions';
-    headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${activeKey.apiKey}`,
-      'HTTP-Referer': 'https://salesbot-ai.local',
-      'X-Title': 'SalesBot AI',
-    };
-  } else if (activeKey.provider === 'groq') {
-    url = 'https://api.groq.com/openai/v1/chat/completions';
-    headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${activeKey.apiKey}`,
-    };
-  } else {
-    url = `${activeKey.baseUrl}/chat/completions`;
-    headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${activeKey.apiKey}`,
-    };
-  }
+    const aiResponse = await chatWithGroq(
+      history.map((item) => ({
+        role: item.isFromBot ? 'assistant' as const : 'user' as const,
+        content: item.content,
+      }))
+    );
 
-  try {
-    const response = await fetch(url, {
+    await db.message.create({
+      data: {
+        conversationId: conversation.id,
+        content: aiResponse,
+        direction: 'outgoing',
+        messageType: 'text',
+        isFromBot: true,
+        status: 'sent',
+      },
+    });
+
+    const intent = analyzeLeadIntent(text);
+    const newScore = calculateLeadScore(history.map((item) => item.content).concat(text), conversation.leadScore);
+    const stage = mapInterestToStage(intent.interest);
+
+    await db.conversation.update({
+      where: { id: conversation.id },
+      data: {
+        name: senderName,
+        username: message.from?.username || null,
+        leadScore: newScore,
+        leadStatus: intent.interest === 'high' ? 'qualified' : intent.interest === 'medium' ? 'interested' : 'new',
+        lastMessage: text.slice(0, 500),
+        lastMessageAt: new Date(),
+        lastMessageDir: 'incoming',
+        unreadCount: { increment: 1 },
+      },
+    });
+
+    if (conversation.lead) {
+      await db.lead.update({
+        where: { conversationId: conversation.id },
+        data: {
+          name: senderName,
+          interest: intent.topics.join(', ') || null,
+          score: newScore,
+          stage,
+          source: 'telegram',
+        },
+      });
+    } else {
+      await db.lead.create({
+        data: {
+          conversationId: conversation.id,
+          name: senderName,
+          interest: intent.topics.join(', ') || null,
+          score: newScore,
+          stage,
+          source: 'telegram',
+        },
+      });
+    }
+
+    const telegramResponse = await fetch(`https://api.telegram.org/bot${connection.botToken}/sendMessage`, {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: activeKey.model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...messages,
-        ],
+        chat_id: chatId,
+        text: aiResponse,
       }),
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      return data.choices?.[0]?.message?.content || 'No pude generar una respuesta.';
-    }
-  } catch (error) {
-    console.error('Error calling AI:', error);
-  }
-
-  return 'Lo siento, no pude procesar tu mensaje en este momento.';
-}
-
-// Analyze lead intent
-function analyzeLeadIntent(message: string): { interest: string; keywords: string[] } {
-  const lowerMessage = message.toLowerCase();
-  const buyKeywords = ['precio', 'costo', 'comprar', 'inscribir', 'disponible', 'horario', 'cuando', 'certificado'];
-  const infoKeywords = ['información', 'curso', 'temario', 'duración', 'requisito'];
-  
-  const foundBuy = buyKeywords.filter(k => lowerMessage.includes(k));
-  const foundInfo = infoKeywords.filter(k => lowerMessage.includes(k));
-  
-  if (foundBuy.length >= 2) {
-    return { interest: 'high', keywords: foundBuy };
-  } else if (foundBuy.length > 0 || foundInfo.length > 0) {
-    return { interest: 'medium', keywords: [...foundBuy, ...foundInfo] };
-  }
-  return { interest: 'low', keywords: [] };
-}
-
-// Calculate lead score
-function calculateLeadScore(messages: string[], currentScore: number = 0): number {
-  let score = currentScore;
-  const positiveWords = ['interesado', 'quiero', 'comprar', 'inscribir', 'precio', 'disponible', 'cuando empieza'];
-  const negativeWords = ['no me interesa', 'caro', 'después', 'no gracias'];
-  
-  messages.forEach(msg => {
-    const lower = msg.toLowerCase();
-    positiveWords.forEach(w => { if (lower.includes(w)) score += 5; });
-    negativeWords.forEach(w => { if (lower.includes(w)) score -= 3; });
-  });
-  
-  return Math.max(0, Math.min(100, score));
-}
-
-// POST - Recibir mensajes de Telegram
-export async function POST(request: NextRequest) {
-  console.log('=== Telegram Webhook Received ===');
-  
-  try {
-    const body = await request.json();
-    console.log('Telegram payload:', JSON.stringify(body, null, 2));
-
-    const message = body.message;
-    if (!message?.text) {
-      return NextResponse.json({ status: 'no_text_message' });
+    if (!telegramResponse.ok) {
+      const errorText = await telegramResponse.text();
+      console.error('Telegram sendMessage error:', errorText);
     }
 
-    const chatId = message.chat?.id?.toString();
-    const userId = message.from?.id?.toString();
-    const userName = message.from?.first_name || message.from?.username || 'Usuario';
-    const content = message.text;
-    const messageId = message.message_id?.toString();
-
-    console.log(`Message from ${userName} (${chatId}): ${content}`);
-
-    // Buscar conexión activa de Telegram
-    const connections = readJsonFile<SocialConnection[]>(SOCIAL_FILE, []);
-    const connection = connections.find(c => c.platform === 'telegram' && c.isActive);
-
-    if (!connection) {
-      console.log('No active Telegram connection found');
-      return NextResponse.json({ status: 'no_connection' });
-    }
-
-    // Buscar o crear conversación
-    const conversations = readJsonFile<Conversation[]>(CONVERSATIONS_FILE, []);
-    let conversation = conversations.find(c => c.externalId === chatId);
-
-    if (!conversation) {
-      conversation = {
-        id: `conv-${Date.now()}`,
-        externalId: chatId || userId,
-        platform: 'telegram',
-        name: userName,
-        username: message.from?.username || null,
-        phone: null,
-        status: 'active',
-        leadStatus: 'new',
-        leadScore: 0,
-        lastMessage: content.substring(0, 200),
-        lastMessageAt: new Date().toISOString(),
-        lastMessageDir: 'incoming',
-        unreadCount: 1,
-        messages: [],
-        createdAt: new Date().toISOString(),
-      };
-      conversations.push(conversation);
-
-      // Crear lead
-      const leads = readJsonFile<Lead[]>(LEADS_FILE, []);
-      leads.push({
-        id: `lead-${Date.now()}`,
-        conversationId: conversation.id,
-        name: userName,
-        email: null,
-        phone: null,
-        interest: null,
-        score: 0,
-        stage: 'awareness',
-        notes: null,
-        source: 'telegram',
-        createdAt: new Date().toISOString(),
-      });
-      writeJsonFile(LEADS_FILE, leads);
-    }
-
-    // Agregar mensaje entrante
-    conversation.messages.push({
-      id: `msg-${Date.now()}`,
-      content,
-      direction: 'incoming',
-      messageType: 'text',
-      isFromBot: false,
-      createdAt: new Date().toISOString(),
-    });
-    conversation.lastMessage = content.substring(0, 200);
-    conversation.lastMessageAt = new Date().toISOString();
-    conversation.lastMessageDir = 'incoming';
-    conversation.unreadCount += 1;
-
-    // Obtener respuesta de IA
-    const chatHistory = conversation.messages
-      .slice(-10)
-      .map(m => ({
-        role: m.direction === 'incoming' ? 'user' as const : 'assistant' as const,
-        content: m.content,
-      }));
-
-    console.log('Calling AI for response...');
-    const aiResponse = await chatWithAI(chatHistory);
-    console.log('AI Response:', aiResponse.substring(0, 100));
-
-    // Agregar mensaje saliente
-    conversation.messages.push({
-      id: `msg-${Date.now()}-reply`,
-      content: aiResponse,
-      direction: 'outgoing',
-      messageType: 'text',
-      isFromBot: true,
-      createdAt: new Date().toISOString(),
-    });
-    conversation.lastMessage = aiResponse.substring(0, 200);
-    conversation.lastMessageAt = new Date().toISOString();
-    conversation.lastMessageDir = 'outgoing';
-
-    // Actualizar lead score
-    const intent = analyzeLeadIntent(content);
-    if (intent.interest === 'high' && conversation.leadStatus === 'new') {
-      conversation.leadStatus = 'interested';
-    }
-    
-    const allMessages = conversation.messages.map(m => m.content);
-    conversation.leadScore = calculateLeadScore(allMessages, conversation.leadScore);
-
-    // Guardar conversación actualizada
-    const convIndex = conversations.findIndex(c => c.id === conversation!.id);
-    if (convIndex >= 0) {
-      conversations[convIndex] = conversation;
-    }
-    writeJsonFile(CONVERSATIONS_FILE, conversations);
-
-    // Enviar respuesta por Telegram API
-    if (connection.botToken) {
-      console.log('Sending reply to Telegram...');
-      const sendResponse = await fetch(
-        `https://api.telegram.org/bot${connection.botToken}/sendMessage`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: aiResponse,
-          }),
-        }
-      );
-      console.log('Telegram send result:', sendResponse.status);
-    }
-
-    return NextResponse.json({ success: true, status: 'processed' });
+    return NextResponse.json({ status: 'ok', reply: aiResponse });
   } catch (error) {
     console.error('Error processing Telegram webhook:', error);
-    return NextResponse.json(
-      { success: false, error: String(error) },
-      { status: 500 }
-    );
+    return NextResponse.json({ status: 'error', error: error instanceof Error ? error.message : 'unknown' }, { status: 500 });
   }
 }
 
-// GET - Para verificar que el webhook está activo
 export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url);
-  const setup = searchParams.get('setup');
-  
-  if (setup === 'true') {
-    // Retornar información de configuración
-    const host = request.headers.get('host') || 'tu-dominio';
-    const protocol = request.headers.get('x-forwarded-proto') || 'https';
-    const webhookUrl = `${protocol}://${host}/api/webhook/telegram`;
-    
-    return NextResponse.json({
-      message: 'Webhook de Telegram activo',
-      webhookUrl,
-      setupInstructions: {
-        step1: 'Obtén tu bot token de @BotFather en Telegram',
-        step2: 'Configura el webhook con este comando:',
-        command: `curl "https://api.telegram.org/bot<TU_BOT_TOKEN>/setWebhook?url=${webhookUrl}"`,
-        example: `curl "https://api.telegram.org/bot8616959739:AAE0bb4-O7Xfuc41Yi3vs9Dq2hCFUkmOYx0/setWebhook?url=${webhookUrl}"`,
-      },
-    });
-  }
-  
-  return NextResponse.json({ status: 'Telegram webhook endpoint active', method: 'Use POST for messages' });
+  const protocol = request.headers.get('x-forwarded-proto') || 'https';
+  const host = request.headers.get('host') || 'localhost:3000';
+  const webhookUrl = `${protocol}://${host}/api/webhook/telegram`;
+
+  return NextResponse.json({
+    success: true,
+    message: 'Webhook de Telegram activo',
+    webhookUrl,
+    instructions: {
+      step1: 'Crea un bot con @BotFather y copia el bot token.',
+      step2: 'Guarda la conexión Telegram en Configuración > Conexiones.',
+      step3: `Ejecuta: curl "https://api.telegram.org/bot<TU_BOT_TOKEN>/setWebhook?url=${webhookUrl}"`,
+      step4: 'Escribe al bot en Telegram para generar conversaciones, leads y respuestas automáticas.',
+    },
+  });
 }
