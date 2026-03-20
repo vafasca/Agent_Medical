@@ -1,0 +1,142 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Turso (libSQL) - SQLite en la nube
+// Para desarrollo local: cambiar provider a "sqlite" y usar file:./dev.db
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// API Keys de proveedores de IA
+model ApiKey {
+  id        String   @id @default(cuid())
+  name      String
+  provider  String
+  apiKey    String
+  baseUrl   String
+  model     String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Conexiones de redes sociales
+model SocialConnection {
+  id            String   @id @default(cuid())
+  platform      String
+  name          String
+  botToken      String?
+  accessToken   String?
+  phoneNumberId String?
+  webhookUrl    String?
+  verifyToken   String?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// Conversaciones
+model Conversation {
+  id             String   @id @default(cuid())
+  externalId     String   @unique
+  platform       String
+  platformUserId String?
+  name           String?
+  username       String?
+  phone          String?
+  email          String?
+  status         String   @default("active")
+  leadStatus     String   @default("new")
+  leadScore      Int      @default(0)
+  lastMessage    String?
+  lastMessageAt  DateTime?
+  lastMessageDir String?
+  unreadCount    Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  messages       Message[]
+  lead           Lead?
+}
+
+// Mensajes
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  externalId     String?
+  content        String
+  direction      String
+  messageType    String   @default("text")
+  mediaUrl       String?
+  metadata       String?
+  status         String   @default("sent")
+  isFromBot      Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+// Leads
+model Lead {
+  id             String   @id @default(cuid())
+  conversationId String   @unique
+  name           String?
+  email          String?
+  phone          String?
+  company        String?
+  interest       String?
+  score          Int      @default(0)
+  stage          String   @default("awareness")
+  source         String?
+  notes          String?
+  tags           String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+// Flujos de automatización
+model Flow {
+  id             String   @id @default(cuid())
+  name           String
+  description    String?
+  isActive       Boolean  @default(true)
+  triggerType    String
+  triggerConfig  String?
+  nodes          String
+  edges          String
+  executionCount Int      @default(0)
+  lastExecuted   DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  executions     FlowExecution[]
+}
+
+// Base de conocimiento
+model KnowledgeBase {
+  id        String   @id @default(cuid())
+  title     String
+  content   String
+  category  String?
+  keywords  String?
+  priority  Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Ejecuciones de flujos
+model FlowExecution {
+  id        String   @id @default(cuid())
+  flowId    String
+  status    String
+  input     String?
+  output    String?
+  error     String?
+  duration  Int?
+  createdAt DateTime @default(now())
+  flow      Flow     @relation(fields: [flowId], references: [id], onDelete: Cascade)
+}
