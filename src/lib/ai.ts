@@ -1,10 +1,5 @@
-import fs from 'fs';
-import path from 'path';
+import { db } from '@/lib/db';
 
-const DATA_DIR = '/home/z/my-project/data';
-const GROQ_KEYS_FILE = path.join(DATA_DIR, 'groq-keys.json');
-
-// Modelos gratuitos disponibles
 export const GROQ_MODELS = [
   { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant', provider: 'groq' },
   { id: 'llama-3.2-1b-preview', name: 'Llama 3.2 1B Preview', provider: 'groq' },
@@ -24,14 +19,14 @@ export function getGroqModels() {
   return [...GROQ_MODELS, ...OPENROUTER_FREE_MODELS];
 }
 
-interface GroqKey {
+interface ApiKeyConfig {
   id: string;
   name: string;
+  provider: 'groq' | 'openai' | 'openrouter' | 'other';
   apiKey: string;
-  url: string;
+  baseUrl: string;
   model: string;
   isActive: boolean;
-  createdAt: string;
 }
 
 interface ChatMessage {
@@ -39,51 +34,84 @@ interface ChatMessage {
   content: string;
 }
 
-function getActiveGroqKey(): GroqKey | null {
-  try {
-    if (!fs.existsSync(GROQ_KEYS_FILE)) return null;
-    const keys: GroqKey[] = JSON.parse(fs.readFileSync(GROQ_KEYS_FILE, 'utf-8'));
-    return keys.find((k) => k.isActive) || keys[0] || null;
-  } catch {
-    return null;
+async function getActiveApiKey(): Promise<ApiKeyConfig | null> {
+  return db.apiKey.findFirst({ where: { isActive: true } }) as Promise<ApiKeyConfig | null>;
+}
+
+export async function hasActiveGroqKey(): Promise<boolean> {
+  return (await getActiveApiKey()) !== null;
+}
+
+export async function getActiveModel(): Promise<string> {
+  const key = await getActiveApiKey();
+  return key?.model || 'llama-3.1-8b-instant';
+}
+
+function resolveProviderRequest(config: ApiKeyConfig) {
+  if (config.provider === 'openrouter') {
+    return {
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.apiKey}`,
+        'HTTP-Referer': 'https://agentmedical.app',
+        'X-Title': 'Agent Medical',
+      },
+    };
   }
-}
 
-export function hasActiveGroqKey(): boolean {
-  return getActiveGroqKey() !== null;
-}
+  if (config.provider === 'groq') {
+    return {
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    };
+  }
 
-export function getActiveModel(): string {
-  const key = getActiveGroqKey();
-  return key?.model || 'llama-3.3-70b-versatile';
+  if (config.provider === 'openai') {
+    return {
+      url: 'https://api.openai.com/v1/chat/completions',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    };
+  }
+
+  return {
+    url: `${config.baseUrl.replace(/\/$/, '')}/chat/completions`,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`,
+    },
+  };
 }
 
 export async function chatWithGroq(
   messages: ChatMessage[],
   systemPrompt?: string
 ): Promise<string> {
-  const groqKey = getActiveGroqKey();
+  const apiKeyConfig = await getActiveApiKey();
 
-  if (!groqKey) {
-    throw new Error('No hay API key de Groq configurada. Ve a Configuración para agregar una.');
+  if (!apiKeyConfig) {
+    throw new Error('No hay API key configurada. Ve a Configuración para agregar una.');
   }
 
-  // Obtener base de conocimiento
   const knowledge = await getKnowledgeContext();
-
   const systemMessage: ChatMessage = {
     role: 'system',
     content: systemPrompt || getDefaultSystemPrompt(knowledge),
   };
 
-  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  const { url, headers } = resolveProviderRequest(apiKeyConfig);
+
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${groqKey.apiKey}`,
-    },
+    headers,
     body: JSON.stringify({
-      model: groqKey.model,
+      model: apiKeyConfig.model,
       messages: [systemMessage, ...messages],
       temperature: 0.7,
       max_tokens: 1024,
@@ -92,28 +120,26 @@ export async function chatWithGroq(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
-    throw new Error(error.error?.message || 'Error en la API de Groq');
+    throw new Error(error.error?.message || 'Error en la API de IA');
   }
 
   const data = await response.json();
-  return data.choices[0]?.message?.content || '';
+  return data.choices?.[0]?.message?.content || '';
 }
 
 async function getKnowledgeContext(): Promise<string> {
-  const KNOWLEDGE_FILE = path.join(DATA_DIR, 'knowledge.json');
-
   try {
-    if (!fs.existsSync(KNOWLEDGE_FILE)) return '';
-    const knowledge = JSON.parse(fs.readFileSync(KNOWLEDGE_FILE, 'utf-8'));
-    const activeKnowledge = knowledge.filter((k: { isActive: boolean }) => k.isActive);
+    const knowledge = await db.knowledgeBase.findMany({
+      where: { isActive: true },
+      orderBy: [{ priority: 'desc' }, { updatedAt: 'desc' }],
+      take: 20,
+    });
 
-    if (activeKnowledge.length === 0) return '';
+    if (knowledge.length === 0) {
+      return '';
+    }
 
-    return activeKnowledge
-      .sort((a: { priority: number }, b: { priority: number }) => b.priority - a.priority)
-      .slice(0, 20)
-      .map((k: { title: string; content: string }) => `## ${k.title}\n${k.content}`)
-      .join('\n\n');
+    return knowledge.map((item) => `## ${item.title}\n${item.content}`).join('\n\n');
   } catch {
     return '';
   }
@@ -153,45 +179,40 @@ export function analyzeLeadIntent(message: string): {
 } {
   const lowerMessage = message.toLowerCase();
 
-  // Palabras clave de alto interés
   const highIntentKeywords = [
     'comprar', 'inscribir', 'registrarme', 'precio', 'costo',
     'cuánto cuesta', 'pagar', 'matricular', 'fechas', 'cuándo empieza',
     'certificado', 'descuento', 'promoción', 'disponible', 'quiero el curso',
-    'necesito', 'urgente', 'ya', 'hoy', 'mañana'
+    'necesito', 'urgente', 'ya', 'hoy', 'mañana',
   ];
 
-  // Palabras clave de medio interés
   const mediumIntentKeywords = [
     'información', 'detalles', 'temario', 'duración', 'horario',
     'requisitos', 'para quién', 'beneficios', 'incluye', 'modalidad',
-    'dónde', 'cómo', 'cuál'
+    'dónde', 'cómo', 'cuál',
   ];
 
-  // Tópicos médicos
   const medicalTopics = [
     'cardiología', 'neurología', 'pediatría', 'ginecología', 'traumatología',
     'dermatología', 'oncología', 'psiquiatría', 'medicina', 'cirugía',
     'enfermería', 'nutrición', 'fisioterapia', 'odontología', 'urgencias',
     'ecografía', 'ultrasonido', 'rayos x', 'laboratorio', 'farmacología',
-    'curso', 'diplomado', 'maestría', 'especialización', 'certificación'
+    'curso', 'diplomado', 'maestría', 'especialización', 'certificación',
   ];
 
   let interest: 'low' | 'medium' | 'high' = 'low';
   const topics: string[] = [];
   let intent = 'exploration';
 
-  // Detectar nivel de interés
-  if (highIntentKeywords.some(kw => lowerMessage.includes(kw))) {
+  if (highIntentKeywords.some((kw) => lowerMessage.includes(kw))) {
     interest = 'high';
     intent = 'purchase_intent';
-  } else if (mediumIntentKeywords.some(kw => lowerMessage.includes(kw))) {
+  } else if (mediumIntentKeywords.some((kw) => lowerMessage.includes(kw))) {
     interest = 'medium';
     intent = 'information_seeking';
   }
 
-  // Detectar tópicos
-  medicalTopics.forEach(topic => {
+  medicalTopics.forEach((topic) => {
     if (lowerMessage.includes(topic)) {
       topics.push(topic);
     }
@@ -200,13 +221,10 @@ export function analyzeLeadIntent(message: string): {
   return { interest, topics, intent };
 }
 
-export function calculateLeadScore(
-  messages: string[],
-  currentScore: number = 0
-): number {
+export function calculateLeadScore(messages: string[], currentScore = 0): number {
   let score = currentScore;
 
-  messages.forEach(msg => {
+  messages.forEach((msg) => {
     const analysis = analyzeLeadIntent(msg);
 
     if (analysis.interest === 'high') {
@@ -217,10 +235,8 @@ export function calculateLeadScore(
       score += 2;
     }
 
-    // Bonus por tópicos específicos
     score += analysis.topics.length * 5;
   });
 
-  // Cap máximo score
   return Math.min(score, 100);
 }
