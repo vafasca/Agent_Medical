@@ -1,22 +1,11 @@
 [build]
-  command = "bun run build"
-  publish = ".next"
+  command = "npm run build"
 
 [build.environment]
   NODE_VERSION = "20"
-  BUN_VERSION = "latest"
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"
-
-[[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/:splat"
-  status = 200
-
-[functions]
-  node_bundler = "esbuild"
-  directory = "netlify/functions"
 
 [[headers]]
   for = "/*"
