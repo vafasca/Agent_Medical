@@ -1,9 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 
-export const DATA_DIR =
-  process.env.APP_DATA_DIR ||
-  path.join(/* turbopackIgnore: true */ process.cwd(), 'data');
+const defaultDataDir = process.env.NETLIFY
+  ? '/tmp/agentmedical-data'
+  : path.join(/* turbopackIgnore: true */ process.cwd(), 'data');
+
+export const DATA_DIR = process.env.APP_DATA_DIR || defaultDataDir;
 
 export function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {

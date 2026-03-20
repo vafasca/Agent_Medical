@@ -1,26 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { db } from '@/lib/db';
-import { readJsonFile } from '@/lib/app-data';
 
-const API_KEYS_FILE = 'api-keys.json';
-
-interface ApiKey {
-  id: string;
-  name: string;
+function resolveProviderRequest(apiKeyConfig: {
   provider: 'groq' | 'openai' | 'openrouter' | 'other';
   apiKey: string;
   baseUrl: string;
-  model: string;
-  isActive: boolean;
-}
-
-function getActiveApiKey(): ApiKey | null {
-  const keys = readJsonFile<ApiKey[]>(API_KEYS_FILE, []);
-  return keys.find((k) => k.isActive) || keys[0] || null;
-}
-
-function resolveProviderRequest(apiKeyConfig: ApiKey) {
+}) {
   if (apiKeyConfig.provider === 'openrouter') {
     return {
       url: 'https://openrouter.ai/api/v1/chat/completions',
@@ -70,7 +56,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: false, error: 'Mensaje requerido' }, { status: 400 });
     }
 
-    const apiKeyConfig = getActiveApiKey();
+    const apiKeyConfig = await db.apiKey.findFirst({ where: { isActive: true } });
     if (!apiKeyConfig) {
       return NextResponse.json(
         { success: false, error: 'No hay API key configurada. Ve a Configuración para agregar una.' },
@@ -84,9 +70,7 @@ export async function POST(request: NextRequest) {
       take: 10,
     });
 
-    const knowledgeContext = knowledge
-      .map((k) => `## ${k.title}\n${k.content}`)
-      .join('\n\n');
+    const knowledgeContext = knowledge.map((k) => `## ${k.title}\n${k.content}`).join('\n\n');
 
     const messages = [
       {

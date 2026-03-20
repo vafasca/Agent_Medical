@@ -38,6 +38,7 @@ Crea `.env`:
 ```env
 DATABASE_URL="file:./prisma/dev.db"
 APP_DATA_DIR="./data"
+TURSO_AUTH_TOKEN="tu_token_de_app_turso"
 ```
 
 ## Paso a paso de uso del sistema
@@ -145,7 +146,8 @@ La arquitectura ya está orientada a eso con `SocialConnection`, `Conversation`,
 3. Node version: `20`.
 4. Variables:
    - `DATABASE_URL`
-   - `APP_DATA_DIR`
+   - `TURSO_AUTH_TOKEN`
+   - `APP_DATA_DIR` (opcional; en Netlify se usa `/tmp/agentmedical-data` por defecto)
 5. Despliega.
 
 ## Siguiente paso recomendado

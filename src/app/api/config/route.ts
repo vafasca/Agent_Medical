@@ -1,13 +1,10 @@
 import { NextResponse } from 'next/server';
 
-import { readJsonFile } from '@/lib/app-data';
-
-const API_KEYS_FILE = 'api-keys.json';
+import { db } from '@/lib/db';
 
 export async function GET() {
   try {
-    const keys = readJsonFile<{ isActive: boolean; model?: string }[]>(API_KEYS_FILE, []);
-    const activeKey = keys.find((k) => k.isActive);
+    const activeKey = await db.apiKey.findFirst({ where: { isActive: true } });
 
     return NextResponse.json({
       success: true,

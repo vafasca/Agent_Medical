@@ -1,19 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-import { readJsonFile, writeJsonFile } from '@/lib/app-data';
-
-const API_KEYS_FILE = 'api-keys.json';
-
-interface ApiKey {
-  id: string;
-  name: string;
-  provider: 'groq' | 'openai' | 'openrouter' | 'other';
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-  isActive: boolean;
-  createdAt: string;
-}
+import { db } from '@/lib/db';
 
 interface Model {
   id: string;
@@ -28,11 +15,6 @@ const OPENROUTER_FREE_MODELS: Model[] = [
   { id: 'meta-llama/llama-3.2-1b-instruct:free', name: 'Llama 3.2 1B (Free)', context_length: 131072 },
   { id: 'google/gemma-2-9b-it:free', name: 'Gemma 2 9B (Free)', context_length: 8192 },
   { id: 'mistralai/mistral-7b-instruct:free', name: 'Mistral 7B (Free)', context_length: 32768 },
-  { id: 'qwen/qwen-2-7b-instruct:free', name: 'Qwen 2 7B (Free)', context_length: 32768 },
-  { id: 'huggingfaceh4/zephyr-7b-beta:free', name: 'Zephyr 7B (Free)', context_length: 4096 },
-  { id: 'openchat/openchat-7b:free', name: 'OpenChat 7B (Free)', context_length: 8192 },
-  { id: 'undi95/toppy-m-7b:free', name: 'Toppy M 7B (Free)', context_length: 4096 },
-  { id: 'gryphe/mythomist-7b:free', name: 'MythoMist 7B (Free)', context_length: 32768 },
 ];
 
 const GROQ_FREE_MODELS: Model[] = [
@@ -44,15 +26,7 @@ const GROQ_FREE_MODELS: Model[] = [
   { id: 'mixtral-8x7b-32768', name: 'Mixtral 8x7B', context_length: 32768 },
 ];
 
-function getApiKeys(): ApiKey[] {
-  return readJsonFile<ApiKey[]>(API_KEYS_FILE, []);
-}
-
-function saveApiKeys(keys: ApiKey[]) {
-  writeJsonFile(API_KEYS_FILE, keys);
-}
-
-function detectProvider(apiKey: string): { provider: ApiKey['provider']; baseUrl: string } {
+function detectProvider(apiKey: string): { provider: 'groq' | 'openai' | 'openrouter' | 'other'; baseUrl: string } {
   if (apiKey.startsWith('sk-or-')) {
     return { provider: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1' };
   }
@@ -113,7 +87,7 @@ async function verifyApiKey(apiKey: string, provider: string): Promise<{ valid: 
     }
 
     if (provider === 'groq') {
-      const apiModels = (data.data || []).map((m: { id: string; owned_by?: string }) => ({
+      const apiModels = (data.data || []).map((m: { id: string }) => ({
         id: m.id,
         name: m.id,
       }));
@@ -133,7 +107,7 @@ async function verifyApiKey(apiKey: string, provider: string): Promise<{ valid: 
 
 export async function GET() {
   try {
-    const keys = getApiKeys();
+    const keys = await db.apiKey.findMany({ orderBy: [{ isActive: 'desc' }, { createdAt: 'desc' }] });
     const masked = keys.map((k) => ({
       ...k,
       url: k.baseUrl,
@@ -162,7 +136,7 @@ export async function GET() {
     });
   } catch (error) {
     console.error('Error en GET /api/groq-keys:', error);
-    return NextResponse.json({ success: true, keys: [] });
+    return NextResponse.json({ success: false, error: 'Error al obtener API keys' }, { status: 500 });
   }
 }
 
@@ -195,25 +169,20 @@ export async function POST(request: NextRequest) {
       openai: 'gpt-4o-mini',
     };
 
-    if (!model) {
-      model = defaultModels[provider] || 'llama-3.1-8b-instant';
-    }
+    const finalModel = model || defaultModels[provider] || 'llama-3.1-8b-instant';
 
-    const keys = getApiKeys().map((key) => ({ ...key, isActive: false }));
+    await db.apiKey.updateMany({ data: { isActive: false } });
 
-    const newKey: ApiKey = {
-      id: `key-${Date.now()}`,
-      name: name || `${provider.toUpperCase()} API`,
-      provider: provider as ApiKey['provider'],
-      apiKey,
-      baseUrl: finalBaseUrl,
-      model,
-      isActive: true,
-      createdAt: new Date().toISOString(),
-    };
-
-    keys.push(newKey);
-    saveApiKeys(keys);
+    const newKey = await db.apiKey.create({
+      data: {
+        name: name || `${provider.toUpperCase()} API`,
+        provider,
+        apiKey,
+        baseUrl: finalBaseUrl,
+        model: finalModel,
+        isActive: true,
+      },
+    });
 
     return NextResponse.json({
       success: true,
@@ -237,7 +206,7 @@ export async function POST(request: NextRequest) {
 export async function DELETE(request: NextRequest) {
   try {
     const { keyId } = await request.json();
-    saveApiKeys(getApiKeys().filter((k) => k.id !== keyId));
+    await db.apiKey.delete({ where: { id: keyId } });
     return NextResponse.json({ success: true });
   } catch {
     return NextResponse.json({ success: false, error: 'Error al eliminar' }, { status: 500 });
@@ -247,22 +216,21 @@ export async function DELETE(request: NextRequest) {
 export async function PATCH(request: NextRequest) {
   try {
     const { keyId, model, isActive, name, baseUrl } = await request.json();
-    const keys = getApiKeys();
 
     if (isActive !== undefined) {
-      keys.forEach((k) => {
-        k.isActive = k.id === keyId;
-      });
+      await db.apiKey.updateMany({ data: { isActive: false } });
+      await db.apiKey.update({ where: { id: keyId }, data: { isActive: Boolean(isActive) } });
     }
 
-    const keyIndex = keys.findIndex((k) => k.id === keyId);
-    if (keyIndex >= 0) {
-      if (model) keys[keyIndex].model = model;
-      if (name) keys[keyIndex].name = name;
-      if (baseUrl) keys[keyIndex].baseUrl = baseUrl;
+    const data: Record<string, string> = {};
+    if (model) data.model = model;
+    if (name) data.name = name;
+    if (baseUrl) data.baseUrl = baseUrl;
+
+    if (Object.keys(data).length > 0) {
+      await db.apiKey.update({ where: { id: keyId }, data });
     }
 
-    saveApiKeys(keys);
     return NextResponse.json({ success: true });
   } catch {
     return NextResponse.json({ success: false, error: 'Error al actualizar' }, { status: 500 });

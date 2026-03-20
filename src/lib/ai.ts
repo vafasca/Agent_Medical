@@ -1,9 +1,5 @@
 import { db } from '@/lib/db';
-import { readJsonFile } from '@/lib/app-data';
 
-const API_KEYS_FILE = 'api-keys.json';
-
-// Modelos gratuitos disponibles
 export const GROQ_MODELS = [
   { id: 'llama-3.1-8b-instant', name: 'Llama 3.1 8B Instant', provider: 'groq' },
   { id: 'llama-3.2-1b-preview', name: 'Llama 3.2 1B Preview', provider: 'groq' },
@@ -38,17 +34,16 @@ interface ChatMessage {
   content: string;
 }
 
-function getActiveApiKey(): ApiKeyConfig | null {
-  const keys = readJsonFile<ApiKeyConfig[]>(API_KEYS_FILE, []);
-  return keys.find((k) => k.isActive) || keys[0] || null;
+async function getActiveApiKey(): Promise<ApiKeyConfig | null> {
+  return db.apiKey.findFirst({ where: { isActive: true } }) as Promise<ApiKeyConfig | null>;
 }
 
-export function hasActiveGroqKey(): boolean {
-  return getActiveApiKey() !== null;
+export async function hasActiveGroqKey(): Promise<boolean> {
+  return (await getActiveApiKey()) !== null;
 }
 
-export function getActiveModel(): string {
-  const key = getActiveApiKey();
+export async function getActiveModel(): Promise<string> {
+  const key = await getActiveApiKey();
   return key?.model || 'llama-3.1-8b-instant';
 }
 
@@ -98,7 +93,7 @@ export async function chatWithGroq(
   messages: ChatMessage[],
   systemPrompt?: string
 ): Promise<string> {
-  const apiKeyConfig = getActiveApiKey();
+  const apiKeyConfig = await getActiveApiKey();
 
   if (!apiKeyConfig) {
     throw new Error('No hay API key configurada. Ve a Configuración para agregar una.');
@@ -144,9 +139,7 @@ async function getKnowledgeContext(): Promise<string> {
       return '';
     }
 
-    return knowledge
-      .map((item) => `## ${item.title}\n${item.content}`)
-      .join('\n\n');
+    return knowledge.map((item) => `## ${item.title}\n${item.content}`).join('\n\n');
   } catch {
     return '';
   }
@@ -190,13 +183,13 @@ export function analyzeLeadIntent(message: string): {
     'comprar', 'inscribir', 'registrarme', 'precio', 'costo',
     'cuánto cuesta', 'pagar', 'matricular', 'fechas', 'cuándo empieza',
     'certificado', 'descuento', 'promoción', 'disponible', 'quiero el curso',
-    'necesito', 'urgente', 'ya', 'hoy', 'mañana'
+    'necesito', 'urgente', 'ya', 'hoy', 'mañana',
   ];
 
   const mediumIntentKeywords = [
     'información', 'detalles', 'temario', 'duración', 'horario',
     'requisitos', 'para quién', 'beneficios', 'incluye', 'modalidad',
-    'dónde', 'cómo', 'cuál'
+    'dónde', 'cómo', 'cuál',
   ];
 
   const medicalTopics = [
@@ -204,22 +197,22 @@ export function analyzeLeadIntent(message: string): {
     'dermatología', 'oncología', 'psiquiatría', 'medicina', 'cirugía',
     'enfermería', 'nutrición', 'fisioterapia', 'odontología', 'urgencias',
     'ecografía', 'ultrasonido', 'rayos x', 'laboratorio', 'farmacología',
-    'curso', 'diplomado', 'maestría', 'especialización', 'certificación'
+    'curso', 'diplomado', 'maestría', 'especialización', 'certificación',
   ];
 
   let interest: 'low' | 'medium' | 'high' = 'low';
   const topics: string[] = [];
   let intent = 'exploration';
 
-  if (highIntentKeywords.some(kw => lowerMessage.includes(kw))) {
+  if (highIntentKeywords.some((kw) => lowerMessage.includes(kw))) {
     interest = 'high';
     intent = 'purchase_intent';
-  } else if (mediumIntentKeywords.some(kw => lowerMessage.includes(kw))) {
+  } else if (mediumIntentKeywords.some((kw) => lowerMessage.includes(kw))) {
     interest = 'medium';
     intent = 'information_seeking';
   }
 
-  medicalTopics.forEach(topic => {
+  medicalTopics.forEach((topic) => {
     if (lowerMessage.includes(topic)) {
       topics.push(topic);
     }
@@ -228,13 +221,10 @@ export function analyzeLeadIntent(message: string): {
   return { interest, topics, intent };
 }
 
-export function calculateLeadScore(
-  messages: string[],
-  currentScore: number = 0
-): number {
+export function calculateLeadScore(messages: string[], currentScore = 0): number {
   let score = currentScore;
 
-  messages.forEach(msg => {
+  messages.forEach((msg) => {
     const analysis = analyzeLeadIntent(msg);
 
     if (analysis.interest === 'high') {
